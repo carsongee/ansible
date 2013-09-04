@@ -21,8 +21,9 @@ import base64
 import socket
 import struct
 import time
-from ansible.callbacks import vvv, vvvv
+from ansible.callbacks import vvv
 from ansible.runner.connection_plugins.ssh import Connection as SSHConnection
+from ansible.runner.connection_plugins.paramiko_ssh import Connection as ParamikoConnection
 from ansible import utils
 from ansible import errors
 from ansible import constants
@@ -46,74 +47,66 @@ class Connection(object):
         self.user = user
         self.key = utils.key_for_hostname(host)
         self.port = port[0]
-        self.accport = port[1]
+        self.fbport = port[1]
         self.is_connected = False
 
-        if not self.port:
-            self.port = constants.DEFAULT_REMOTE_PORT
-        elif not isinstance(self.port, int):
-            self.port = int(self.port)
-
-        if not self.accport:
-            self.accport = constants.ACCELERATE_PORT
-        elif not isinstance(self.accport, int):
-            self.accport = int(self.accport)
-
-        self.ssh = SSHConnection(
-            runner=self.runner,
-            host=self.host, 
-            port=self.port, 
-            user=self.user, 
-            password=password, 
-            private_key_file=private_key_file
-        )
+        if self.runner.original_transport == "paramiko":
+            self.ssh = ParamikoConnection(
+                runner=self.runner,
+                host=self.host,
+                port=self.port,
+                user=self.user,
+                password=password,
+                private_key_file=private_key_file
+            )
+        else:
+            self.ssh = SSHConnection(
+                runner=self.runner,
+                host=self.host,
+                port=self.port,
+                user=self.user,
+                password=password,
+                private_key_file=private_key_file
+            )
 
         # attempt to work around shared-memory funness
         if getattr(self.runner, 'aes_keys', None):
             utils.AES_KEYS = self.runner.aes_keys
 
-    def _execute_accelerate_module(self):
-        args = "password=%s port=%s debug=%d" % (base64.b64encode(self.key.__str__()), str(self.accport), int(utils.VERBOSITY))
-        inject = dict(password=self.key)
-        if self.runner.accelerate_inventory_host:
-            inject = utils.combine_vars(inject, self.runner.inventory.get_variables(self.runner.accelerate_inventory_host))
-        else:
-            inject = utils.combine_vars(inject, self.runner.inventory.get_variables(self.host))
-        vvvv("attempting to start up the accelerate daemon...")
+    def _execute_fb_module(self):
+        args = "password=%s port=%s" % (base64.b64encode(self.key.__str__()), str(self.fbport))
         self.ssh.connect()
         tmp_path = self.runner._make_tmp_path(self.ssh)
-        return self.runner._execute_module(self.ssh, tmp_path, 'accelerate', args, inject=inject)
+        return self.runner._execute_module(self.ssh, tmp_path, 'accelerate', args, inject={"password":self.key})
 
     def connect(self, allow_ssh=True):
         ''' activates the connection object '''
 
         try:
             if not self.is_connected:
+                # TODO: make the timeout and retries configurable?
                 tries = 3
                 self.conn = socket.socket()
-                self.conn.settimeout(constants.ACCELERATE_CONNECT_TIMEOUT)
-                vvvv("attempting connection to %s via the accelerated port %d" % (self.host,self.accport))
+                self.conn.settimeout(300.0)
                 while tries > 0:
                     try:
-                        self.conn.connect((self.host,self.accport))
+                        self.conn.connect((self.host,self.fbport))
                         break
                     except:
-                        vvvv("failed, retrying...")
                         time.sleep(0.1)
                         tries -= 1
                 if tries == 0:
                     vvv("Could not connect via the accelerated connection, exceeded # of tries")
                     raise errors.AnsibleError("Failed to connect")
-                self.conn.settimeout(constants.ACCELERATE_TIMEOUT)
         except:
             if allow_ssh:
                 vvv("Falling back to ssh to startup accelerated mode")
-                res = self._execute_accelerate_module()
+                res = self._execute_fb_module()
                 if not res.is_successful():
                     raise errors.AnsibleError("Failed to launch the accelerated daemon on %s (reason: %s)" % (self.host,res.result.get('msg')))
                 return self.connect(allow_ssh=False)
             else:
-                raise errors.AnsibleError("Failed to connect to %s:%s" % (self.host,self.accport))
+                raise errors.AnsibleError("Failed to connect to %s:%s" % (self.host,self.fbport))
         self.is_connected = True
         return self
 
@@ -125,24 +118,18 @@ class Connection(object):
         header_len = 8 # size of a packed unsigned long long
         data = b""
         try:
-            vvvv("%s: in recv_data(), waiting for the header" % self.host)
             while len(data) < header_len:
-                d = self.conn.recv(header_len - len(data))
+                d = self.conn.recv(1024)
                 if not d:
-                    vvvv("%s: received nothing, bailing out" % self.host)
                     return None
                 data += d
-            vvvv("%s: got the header, unpacking" % self.host)
             data_len = struct.unpack('Q',data[:header_len])[0]
             data = data[header_len:]
-            vvvv("%s: data received so far (expecting %d): %d" % (self.host,data_len,len(data)))
             while len(data) < data_len:
-                d = self.conn.recv(data_len - len(data))
+                d = self.conn.recv(1024)
                 if not d:
-                    vvvv("%s: received nothing, bailing out" % self.host)
                     return None
                 data += d
-            vvvv("%s: received all of the data, returning" % self.host)
             return data
         except socket.timeout:
             raise errors.AnsibleError("timed out while waiting to receive data")
@@ -150,10 +137,7 @@ class Connection(object):
     def exec_command(self, cmd, tmp_path, sudo_user, sudoable=False, executable='/bin/sh'):
         ''' run a command on the remote host '''
 
-        if executable == "":
-            executable = constants.DEFAULT_EXECUTABLE
-
-        if self.runner.sudo and sudoable and sudo_user:
+        if self.runner.sudo or sudoable and sudo_user:
             cmd, prompt = utils.make_sudo_cmd(sudo_user, executable, cmd)
 
         vvv("EXEC COMMAND %s" % cmd)
@@ -167,24 +151,13 @@ class Connection(object):
         data = utils.jsonify(data)
         data = utils.encrypt(self.key, data)
         if self.send_data(data):
-            raise errors.AnsibleError("Failed to send command to %s" % self.host)
+            raise errors.AnisbleError("Failed to send command to %s" % self.host)
         
-        while True:
-            # we loop here while waiting for the response, because a 
-            # long running command may cause us to receive keepalive packets
-            # ({"pong":"true"}) rather than the response we want. 
-            response = self.recv_data()
-            if not response:
-                raise errors.AnsibleError("Failed to get a response from %s" % self.host)
-            response = utils.decrypt(self.key, response)
-            response = utils.parse_json(response)
-            if "pong" in response:
-                # it's a keepalive, go back to waiting
-                vvvv("%s: received a keepalive packet" % self.host)
-                continue
-            else:
-                vvvv("%s: received the response" % self.host)
-                break
+        response = self.recv_data()
+        if not response:
+            raise errors.AnsibleError("Failed to get a response from %s" % self.host)
+        response = utils.decrypt(self.key, response)
+        response = utils.parse_json(response)
 
         return (response.get('rc',None), '', response.get('stdout',''), response.get('stderr',''))
 
@@ -200,10 +173,9 @@ class Connection(object):
         fstat = os.stat(in_path)
         try:
             vvv("PUT file is %d bytes" % fstat.st_size)
-            last = False
-            while fd.tell() <= fstat.st_size and not last:
-                vvvv("file position currently %ld, file size is %ld" % (fd.tell(), fstat.st_size))
+            while fd.tell() < fstat.st_size:
                 data = fd.read(CHUNK_SIZE)
+                last = False
                 if fd.tell() >= fstat.st_size:
                     last = True
                 data = dict(mode='put', data=base64.b64encode(data), out_path=out_path, last=last)
@@ -225,7 +197,6 @@ class Connection(object):
                     raise errors.AnsibleError("failed to put the file in the requested location")
         finally:
             fd.close()
-            vvvv("waiting for final response after PUT")
             response = self.recv_data()
             if not response:
                 raise errors.AnsibleError("Failed to get a response from %s" % self.host)
