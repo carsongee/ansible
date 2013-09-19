@@ -444,7 +444,6 @@ def create_instances(module, ec2):
             if vpc_subnet_id:
                 if LooseVersion(boto.__version__) < LooseVersion('2.13'):
                     module.fail_json(msg = "boto > 2.13 required for VPC instances")
-
                 network_interfaces = NetworkInterfaceCollection()
                 network_interfaces.append(
                     NetworkInterfaceSpecification(
@@ -573,7 +572,7 @@ def main():
             instance_tags = dict(),
             vpc_subnet_id = dict(),
             private_ip = dict(),
-            associate_public_ip = dict(type='bool', default=True),
+            associate_public_ip = dict(choices=BOOLEANS, default=True),
             instance_profile_name = dict(),
             instance_ids = dict(type='list'),
             state = dict(default='present'),
