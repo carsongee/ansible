@@ -82,7 +82,13 @@ options:
         - The key pair name to be used when creating a VM
      required: false
      default: None
+   availability_zone:
+     description:
+        - The name of the availability zone to which the VM should be added
+     required: false
+     default: None
    security_groups:
+     version_added: "1.7"
      description:
         - The name of the security group to which the VM should be added
      required: false
@@ -107,12 +113,6 @@ options:
         - The amount of time the module should wait for the VM to get into active state
      required: false
      default: 180
-   user_data:
-     description:
-        - Opaque blob of data which is made available to the instance
-     required: false
-     default: None
-     version_added: "1.6"
 requirements: ["novaclient"]
 '''
 
@@ -163,8 +163,7 @@ def _create_server(module, nova):
                 'meta' : module.params['meta'],
                 'key_name': module.params['key_name'],
                 'security_groups': module.params['security_groups'].split(','),
-                #userdata is unhyphenated in novaclient, but hyphenated here for consistency with the ec2 module:
-                'userdata': module.params['user_data'],
+                'availability_zone': module.params['availability_zone'],
     }
     if not module.params['key_name']:
         del bootkwargs['key_name']
@@ -201,12 +200,7 @@ def _get_server_state(module, nova):
     try:
         servers = nova.servers.list(True, {'name': module.params['name']})
         if servers:
-            # the {'name': module.params['name']} will also return servers
-            # with names that partially match the server name, so we have to
-            # strictly filter here
-            servers = [x for x in servers if x.name == module.params['name']]
-            if servers:
-                server = servers[0]
+            server = [x for x in servers if x.name == module.params['name']][0]
     except Exception, e:
         module.fail_json(msg = "Error in getting the server list: %s" % e.message)
     if server and module.params['state'] == 'present':
@@ -235,13 +229,13 @@ def main():
         image_id                        = dict(default=None),
         flavor_id                       = dict(default=1),
         key_name                        = dict(default=None),
+        availability_zone               = dict(default=None),
         security_groups                 = dict(default='default'),
         nics                            = dict(default=None),
         meta                            = dict(default=None),
         wait                            = dict(default='yes', choices=['yes', 'no']),
         wait_for                        = dict(default=180),
-        state                           = dict(default='present', choices=['absent', 'present']),
-        user_data                       = dict(default=None)
+        state                           = dict(default='present', choices=['absent', 'present'])
         ),
     )
 
@@ -249,7 +243,6 @@ def main():
                               module.params['login_password'],
                               module.params['login_tenant_name'],
                               module.params['auth_url'],
-                              region_name=module.params['region_name'],
                               service_type='compute')
     try:
         nova.authenticate()
